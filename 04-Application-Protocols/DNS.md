@@ -1,5 +1,3 @@
-# DNS 学习笔记
-
 ## 一、DNS 是什么？
 
 **DNS**：Domain Name System（域名系统）
