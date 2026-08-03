@@ -1,5 +1,3 @@
-# DHCP 学习笔记
-
 ## 一、DHCP 是什么？
 
 **DHCP** 全称：Dynamic Host Configuration Protocol（动态主机配置协议）
