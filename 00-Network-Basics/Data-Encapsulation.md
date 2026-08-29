@@ -372,6 +372,3 @@ echo -ne "GET / HTTP/1.0\r\nHost: 192.168.1.20\r\n\r\n" | nc -w 1 192.168.1.20 8
 12. **MITRE ATT&CK** — [TA0007: Discovery](https://attack.mitre.org/tactics/TA0007/)（网络嗅探相关），[T1040: Network Sniffing](https://attack.mitre.org/techniques/T1040/)
 13. **OWASP Cheat Sheet Series** — [Transport Layer Protection Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Transport_Layer_Protection_Cheat_Sheet.html)
 14. **Linux内核Git提交** — `commit 2c956a60778c`（SipHash引入相关），建议读者查阅具体内核源码以确认精确版本边界
-
-
-**评审结束语**：本文经过修正后，将成为一篇兼具教学深度与实战参考价值的优秀技术文档。建议作者按上述P0/P1问题优先修正后发布。感谢您的投稿！
