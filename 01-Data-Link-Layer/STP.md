@@ -5,11 +5,11 @@
 > **合规声明**：本文所有攻击技术描述**仅限用于网络安全防护研究与获得书面授权的隔离环境安全测试**。未经授权的STP操纵、BPDU注入、TCN泛洪等行为，违反《中华人民共和国网络安全法》第二十七条及《中华人民共和国刑法》第二百八十五条，切勿用于非法目的。
 
 
-## 一、协议解剖：BPDU报文的"基因序列"
+## 一、协议解剖：BPDU报文的“基因序列”
 
 STP（Spanning Tree Protocol，IEEE 802.1D-2004）的所有逻辑都封装在BPDU（Bridge Protocol Data Unit）中。BPDU**不封装在IP包中**，而是**直接封装在IEEE 802.3以太网帧中**，目的MAC地址为受限制组播地址：`01:80:C2:00:00:00`。
 
-> **工程安全意义**：该组播地址在IEEE 802.1D中被定义为"不跨网桥转发"（Non-Forwardable）。这意味着BPDU在交换机上被接收并送CPU处理后，**不会转发到其他端口**。正是这一机制使得BPDU Guard能在接入端口有效生效——BPDU不会跨交换机传播到更上层网络。
+> **工程安全意义**：该组播地址在IEEE 802.1D中被定义为“不跨网桥转发”（Non-Forwardable）。这意味着BPDU在交换机上被接收并送CPU处理后，**不会转发到其他端口**。正是这一机制使得BPDU Guard能在接入端口有效生效——BPDU不会跨交换机传播到更上层网络。
 
 ### 完整的BPDU帧结构（IEEE 802.1D-2004标准）
 
@@ -41,14 +41,14 @@ STP（Spanning Tree Protocol，IEEE 802.1D-2004）的所有逻辑都封装在BPD
 └─────────────────────────────────────────────────────────────┘
 ```
 
-> **关键注意**：STP BPDU使用**IEEE 802.2 LLC封装**，以太网帧长度字段值为38（0x0026），不包含以太网尾部填充。不足最小帧长64字节的部分由物理层自动填充。
+> **帧长说明**：BPDU数据部分（LLC 3B + BPDU载荷35B）= 38字节，加上以太网首部14字节，共计52字节。**因未达到以太网最小帧长64字节，物理层会自动填充12字节的Padding**。Wireshark抓包中看到的帧长为64字节，即包含该填充。
 
 
-## 二、选举算法的"原子级"拆解
+## 二、选举算法的“原子级”拆解
 
 ### 2.1 根桥选举：四步决策链
 
-初始时，每个交换机都认为自己是根桥。交换机收到BPDU后，提取"根桥ID"与本机保存的比较：**先比优先级（数值越小越优），再比MAC地址（数值越小越优）** 。若收到的更优，则更新并中继该BPDU。
+初始时，每个交换机都认为自己是根桥。交换机收到BPDU后，提取“根桥ID”与本机保存的比较：**先比优先级（数值越小越优），再比MAC地址（数值越小越优）** 。若收到的更优，则更新并中继该BPDU。
 
 ### 2.2 端口角色选举：决定性因子优先序
 
@@ -86,28 +86,30 @@ spanning-tree pathcost method long   ! 全网切换至长格式
 | 故障类型 | 判定机制 | 收敛时间 | 公式 |
 |:---|:---|:---:|:---|
 | **直接故障**（物理链路断开） | 端口立即检测载波丢失 | **30秒** | `2 × Forward_Delay = 30秒` |
-| **间接故障**（对端静默死机） | 等待Max Age（20秒） | **50秒** | `Max_Age + 2 × Forward_Delay = 50秒` |
+| **间接故障**（对端静默死机） | 等待`Message Age`累计超过`Max Age`（默认20秒，实际因BPDU发送间隔2秒，超时约18～24秒） | **50秒** | `Max_Age + 2 × Forward_Delay = 50秒` |
 
 ### 3.2 RSTP（IEEE 802.1w）快速收敛
 
-RSTP通过**Proposal/Agreement握手**实现在全双工点对点链路上的亚秒级收敛（<1秒），彻底解决了传统STP 30-50秒的性能瓶颈（详见第4.1节）。
+**【修正】RSTP通过Proposal/Agreement握手实现在**全双工点对点链路**上的亚秒级收敛（<1秒），彻底解决了传统STP 30-50秒的性能瓶颈（详见第4.1节）。
 
 
 ## 四、RSTP（802.1w）与MSTP（802.1s）的深度差异
 
-### 4.1 RSTP的Proposal/Agreement机制
+### 4.1 RSTP的Proposal/Agreement机制（修正版）
 
-**触发前提（缺一不可）** ：
-1. 链路两端协商为**点对点（Point-to-Point）** ——Cisco中全双工链路默认视为P2P（半双工禁用Proposal/Agreement，回退至传统STP收敛）；
+**【修正】RSTP通过Proposal/Agreement握手实现在**全双工点对点链路**上的亚秒级收敛（<1秒）。
+
+**生效前提（全部必须满足）** ：
+1. **链路必须为全双工点对点链路**（Cisco中全双工链路默认视为P2P；**半双工链路强制回退至传统STP收敛**，即30秒）；
 2. 发送Proposal的端口必须是**指定端口（Designated Port）** ；
-3. 下游交换机在收到Proposal后需完成与下游设备的同步，再回复Agreement。
+3. 下游交换机在收到Proposal后需完成与下游设备的同步（阻塞所有非边缘端口），再回复Agreement。
 
 **工作流程**：
 1. 上游指定端口发送 `Proposal=1` 的RSTP BPDU；
 2. 下游收到后，阻塞本设备所有其他非边缘端口，回复 `Agreement=1`；
 3. 上游收到后立刻进入Forwarding。
 
-满足以上条件时，全双工链路上收敛时间 **<1秒**。
+**满足以上全部条件时**，全双工链路上收敛时间 **<1秒**。
 
 ### 4.2 RSTP端口角色扩展
 
@@ -137,36 +139,40 @@ spanning-tree mst 1 priority 4096   ! 实例1根桥（优先级必须是4096的�
 spanning-tree mst 2 priority 8192   ! 实例2备份根桥
 ```
 
+> **⚠️ 关键注意（缺省MSTI）** ：在MSTP中，**所有未显式映射到非零实例的VLAN默认属于Instance 0（缺省MSTI）** 。Instance 0的根桥选举独立于Instance 1/2。若网络中存在VLAN 70未映射，其生成树将跟随Instance 0的拓扑，**不会享受Instance 1/2的负载均衡**。请确保所有需要负载均衡的VLAN均已显式映射。
+>
+> **区域一致性要求**：`name REGION1`、`revision 1` 以及VLAN到实例的映射表，必须在同一MST区域内的**所有交换机上完全一致**，否则交换机之间将无法聚合为同一区域，MSTP实例将无法跨交换机生效。
 
-## 五、攻防实战的"手术刀级"细节
 
-> **⚠️ 严重风险警示**：`yersinia` 等工具会对二层拓扑造成毁灭性打击，**严禁在非隔离实验环境运行**。`yersinia`需从官方源安装（Kali中`apt install yersinia`），依赖`libnet`等库，安装前需确认网络可达。
+## 五、攻防实战的“手术刀级”细节
+
+> **⚠️ 严重风险警示**：`yersinia` 等工具会对二层拓扑造成毁灭性打击，**严禁在非隔离实验环境运行**。确保攻击实验所在的网段已通过VLAN或物理隔离与生产环境完全分离。`yersinia`需从官方源安装（Kali中`apt install yersinia`），依赖`libnet`等库。
 
 ### 5.1 攻击工具工作原理（以 `yersinia` 为例）
 
-运行Root抢占攻击时，`yersinia`构造以太网帧（目的MAC `01:80:C2:00:00:00`），将BPDU载荷中的"根桥ID"优先级设为`0`，以极高频率发送。由于`0`小于合法交换机默认的32768，全网被迫将攻击机视为新根桥，所有根端口指向攻击者，实现流量路径重定向（**真正的MITM需结合ARP欺骗完成数据拦截**）。
+运行Root抢占攻击时，`yersinia`构造以太网帧（目的MAC `01:80:C2:00:00:00`），将BPDU载荷中的“根桥ID”优先级设为`0`，以极高频率发送。由于`0`小于合法交换机默认的32768，全网被迫将攻击机视为新根桥，所有根端口指向攻击者，实现流量路径重定向（**真正的MITM需结合ARP欺骗完成数据拦截**）。
 
 ### 5.2 攻击变形：TCN泛洪攻击
 
 **传统STP域内**：攻击者伪造TCN BPDU（类型0x80）持续发送。根桥收到后泛洪带TC标志的配置BPDU，全网交换机将MAC老化时间缩短至15秒，导致MAC表频繁刷新、单播泛洪加剧、网络性能崩溃。
 
-**纯RSTP域内**：RSTP废弃了TCN BPDU（类型0x80）——感知拓扑变更时直接通过RSTP BPDU标志位传播TC事件。攻击者在**纯RSTP域内**伪造TCN BPDU无效。
+**纯RSTP域内**：RSTP废弃了TCN BPDU（类型0x80）——感知拓扑变更时直接通过RSTP BPDU标志位传播TC事件。攻击者在**纯RSTP域内**伪造传统TCN BPDU（类型0x80）**无效**。
 
-**⚠️ 混合环境边界情况**：在RSTP与旧STP域交界处，边界交换机在兼容模式下**仍会接收并转换旧域的TCN**为本域的RSTP TC事件。若网络中存在STP/RSTP混合模式，TCN泛洪攻击仍可通过边界间接影响RSTP域。安全评估中**应优先确认全网STP模式是否统一**。
+**【修正】⚠️ 混合环境边界情况**：当RSTP交换机的某端口**收到来自STP交换机的BPDU（类型0x00）时，该端口自动回退至STP兼容模式**。在此模式下，来自STP域的TCN BPDU将被转换为RSTP TC事件并在RSTP域内传播。因此，**若网络中存在STP/RSTP混合部署，即使攻击者接入的是RSTP域边缘，仍可能通过边界交换机的兼容端口间接影响RSTP域**。安全评估中**应优先确认全网STP模式是否统一**，或在边界端口手动配置`spanning-tree link-type point-to-point`强制RSTP行为（但可能影响与STP交换机的互通）。
 
 ### 5.3 防御的底层逻辑
 
 #### 5.3.1 BPDU Guard（硬件级切断）
-交换机ASIC对STP组播MAC设硬件过滤规则，上送CPU。BPDU Guard启用时，CPU收到BPDU立即将端口置为`errdisable`。
+交换机ASIC对STP组播MAC设硬件过滤规则，上送CPU。BPDU Guard启用时，CPU收到BPDU立即将端口置为`errdisable`（需手动或`errdisable recovery`定时恢复）。
 ```cisco
 spanning-tree portfast bpduguard default   ! 全局生效（所有Access端口）
 ```
 
 #### 5.3.2 Root Guard（根桥位置锁定）
-在端口启用`spanning-tree guard root`后，若收到比当前根桥**更优**的BPDU，端口进入**Root-Inconsistent**状态（阻塞数据但继续监控BPDU）。一旦攻击停止，端口可自动恢复（需`errdisable recovery`启用）。
+在端口启用`spanning-tree guard root`后，若收到比当前根桥**更优**的BPDU，端口进入**Root-Inconsistent**状态（阻塞数据但继续监控BPDU）。**【修正】该状态在更优BPDU停止后自动恢复，无需手工干预或`errdisable recovery`配置**。这与BPDU Guard触发的Err-Disable状态有本质区别。
 
 #### 5.3.3 Loop Guard（单向链路防护）
-为防止因单向链路故障导致的"替代端口错误进入Forwarding"造成的环路，在级联端口启用：
+为防止因单向链路故障导致的“替代端口错误进入Forwarding”造成的环路，在级联端口启用：
 ```cisco
 spanning-tree guard loop
 ```
@@ -227,9 +233,9 @@ interface GigabitEthernet0/24
 
 ## 七、总结
 
-STP协议是二层网络的"拓扑守护者"，其BPDU中的每一个字段都是攻防双方争夺的制高点。攻击者通过伪造BPDU抢占根桥、泛洪TCN扰乱MAC表或强制版本降级来破坏网络；防御方通过Root Guard锁定根桥位置、通过BPDU Guard切断非法接入、通过Loop Guard防范单向链路环路。
+STP协议是二层网络的“拓扑守护者”，其BPDU中的每一个字段都是攻防双方争夺的制高点。攻击者通过伪造BPDU抢占根桥、泛洪TCN扰乱MAC表或强制版本降级来破坏网络；防御方通过Root Guard锁定根桥位置、通过BPDU Guard切断非法接入、通过Loop Guard防范单向链路环路。
 
-理解STP从"慢速收敛（30-50秒）"到RSTP"亚秒级Proposal/Agreement"的演进，以及在MSTP中实现VLAN级负载均衡，是构建高可用大二层网络的必修课。下一步，建议将STP知识与VLAN安全、MAC地址表攻防串联，构建完整的二层安全知识体系。
+理解STP从“慢速收敛（30-50秒）”到RSTP“亚秒级Proposal/Agreement”的演进，以及在MSTP中实现VLAN级负载均衡，是构建高可用大二层网络的必修课。下一步，建议将STP知识与VLAN安全、MAC地址表攻防串联，构建完整的二层安全知识体系。
 
 
 ## 参考文献与延伸阅读
@@ -241,7 +247,7 @@ STP协议是二层网络的"拓扑守护者"，其BPDU中的每一个字段都�
 
 ### 工程文档
 - Cisco Catalyst 3850 Layer 2 Switching Configuration Guide, IOS XE Release 16.x
-- Cisco "Spanning Tree Protocol (STP) PortFast, BPDU Guard, BPDU Filter, Root Guard, and Loop Guard" — 官方配置指南
+- Cisco “Spanning Tree Protocol (STP) PortFast, BPDU Guard, BPDU Filter, Root Guard, and Loop Guard” — 官方配置指南
 - MITRE ATT&CK — [T1557: Adversary-in-the-Middle](https://attack.mitre.org/techniques/T1557/)
 
 ---
