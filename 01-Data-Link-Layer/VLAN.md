@@ -9,7 +9,7 @@
 
 VLAN（Virtual Local Area Network，虚拟局域网）是一种在物理交换机上划分多个逻辑独立网络的技术。在没有VLAN的环境中，所有设备同属一个广播域；引入VLAN后，虽然设备物理上连接在同一台交换机，逻辑上却相当于处于不同的交换机之中，广播流量被有效隔离。
 
-> **规范来源**：IEEE 802.1Q-2022 "Bridges and Bridged Networks"。
+> **规范来源**：IEEE 802.1Q-2022 “Bridges and Bridged Networks”。
 
 
 ## 二、VLAN的核心应用价值
@@ -44,9 +44,11 @@ VLAN工作在OSI模型的**数据链路层（第二层）** 。802.1Q标准在�
 - **TPID**：固定值为`0x8100`。QinQ（802.1ad）场景中，外层TPID可为`0x88A8`。
 - **VID**：12位，数值范围0–4095。**可用配置范围1–4094**（VLAN 0用于优先级Tag，VLAN 4095保留，均不可配置）。
 - **保留VLAN说明**：
-  - VLAN 1：默认VLAN（IEEE 802.1Q中称"Default VID"，Cisco默认端口均属于VLAN 1）；
-  - VLAN 1002–1005：在Cisco交换机上**保留给FDDI/Token Ring**，不可用于常规以太网VLAN配置。
+  - VLAN 1：默认VLAN（IEEE 802.1Q中称“Default VID”，Cisco默认端口均属于VLAN 1）；
+  - VLAN 1002–1005：在**部分Cisco平台（如传统CatOS）** 上保留给FDDI/Token Ring，默认状态下不可用于常规以太网VLAN配置。**但在IOS XE平台（如3850/9300）上，可通过先执行`no vlan 1002-1005`删除后重新利用这些VLAN ID**。生产环境中建议查阅目标平台官方文档以确认具体行为。
 - **PCP（Priority Code Point）** ：3位，802.1p优先级（0～7），用于QoS分类。
+
+> **MTU影响**：802.1Q标签插入后，帧长度增加4字节，最大帧长从1518字节变为1522字节（含首部），Payload最大仍为1500字节。若网络中设备未启用Jumbo Frame支持，带标签的帧可能因超过标准MTU而被丢弃。**生产环境中建议在Trunk链路上启用Jumbo Frame（Cisco中配置`mtu 1504`或`system mtu`）以确保MTU一致性。**
 
 
 ## 四、交换机端口模式与帧处理流程
@@ -66,16 +68,19 @@ VLAN工作在OSI模型的**数据链路层（第二层）** 。802.1Q标准在�
 > ⚠️ 两端Trunk端口的Native VLAN ID必须一致，否则会产生`%CDP-4-NATIVE_VLAN_MISMATCH`告警，可能导致非预期的VLAN穿越或通信中断。
 
 
-## 五、VLAN 1的"幽灵风险"与Native VLAN安全加固
+## 五、VLAN 1的“幽灵风险”与Native VLAN安全加固
 
 ### 5.1 为什么VLAN 1是高风险VLAN？
 
 1. **默认配置**：所有交换机端口默认属于VLAN 1；Trunk默认允许VLAN 1通过且Native VLAN默认为1；
-2. **控制协议依赖**：VTP、DTP等管理协议默认使用VLAN 1作为管理VLAN（CDP虽为二层协议，EtherType 0x2000，也通常在Native VLAN上传输）；
+2. **控制协议依赖**：VTP、DTP等管理协议默认使用VLAN 1作为管理VLAN（CDP协议EtherType 0x2000，在Cisco工程实现中亦在Native VLAN上传输）；
 3. **不可删除**：VLAN 1作为默认VLAN，在大多数Cisco平台**不可删除**（`no vlan 1`被拒绝）。攻击者若接入VLAN 1的Access端口，可借助以上特性发起DTP协商或VLAN跳跃攻击。
 
 ### 5.2 生产环境标准配置（双重保护）
 ```cisco
+! 前置条件：确保VLAN 999已在交换机上创建且处于active状态
+vlan 999
+
 interface GigabitEthernet0/24
  switchport trunk native vlan 999           ! ① 修改Native VLAN为非默认值
  switchport trunk allowed vlan 10,20,30,999 ! ② 限制允许的VLAN列表
@@ -91,15 +96,15 @@ show running-config | include dot1q tag native   ! 确认Native VLAN Tagging是�
 
 ## 六、攻击手法深度拆解
 
-> **⚠️ 严重风险警示**：以下攻击手法的实现工具（yersinia、scapy）高频发包可能导致老款交换机CPU满载宕机，**严禁在非隔离实验环境运行**。攻击者的网卡必须支持VLAN Tagging（多数普通网卡默认支持，但需操作系统配置VLAN子接口）。
+> **⚠️ 严重风险警示**：以下攻击手法的实现工具（yersinia、scapy）高频发包可能导致老款交换机CPU满载宕机，**严禁在非隔离实验环境运行**。攻击者需在操作系统层面创建VLAN子接口或使用支持构造802.1Q Tag的工具（如Scapy的`Dot1Q`层），否则普通应用程序无法发送带Tag的帧。
 
 ### 6.1 Switch Spoofing（交换机欺骗）——DTP协议滥用
 
 DTP（Dynamic Trunk Protocol）是Cisco私有协议，用于自动协商链路是否成为Trunk。DTP帧不包含设备类型声明，但包含**协商状态值**（Desirable/Auto/Trunk等）。
 
 **DTP协商生效条件**：
-- 两端端口VLAN 1需连通（DTP帧在VLAN 1上传输）；
-- 协议模式匹配规则：`dynamic desirable`可主动发起协商；`dynamic auto`只能被动响应；
+- 端口模式必须为`dynamic desirable`（主动发起）或`dynamic auto`（被动响应）；
+- DTP帧在VLAN 1上传输，**由于所有端口默认属于VLAN 1，该条件在默认配置下自动满足**；
 - 若目标端口被静态配置为`trunk`或`access`模式，则DTP协商不会改变其模式。
 
 | Cisco型号 | 默认DTP模式 |
@@ -116,8 +121,10 @@ DTP（Dynamic Trunk Protocol）是Cisco私有协议，用于自动协商链路�
 ```cisco
 interface GigabitEthernet0/1
  switchport mode access         ! 强制Access，拒绝DTP协商
- switchport nonegotiate         ! 不发送也不响应DTP帧
+ switchport nonegotiate         ! 禁止发送DTP帧；对收到的DTP帧不予响应
 ```
+
+**注意**：`switchport nonegotiate`仅**禁止发送**DTP协商帧，端口仍可接收DTP帧（但不做响应）。生产环境最安全的做法是直接强制`mode access`，此时即使收到DTP帧亦不影响端口状态。
 
 **验证**：`show interfaces trunk`——攻击端口不应出现在Trunk列表中。
 
@@ -125,10 +132,16 @@ interface GigabitEthernet0/1
 
 该攻击利用802.1Q Native VLAN在Trunk出站时不带Tag的机制。
 
-**攻击前提**：
-攻击者的计算机接入**第一台交换机的Access端口**，该端口的PVID必须等于**第一台交换机连接第二台交换机的Trunk端口的Native VLAN**（例如两者都是VLAN 1）。换言之，攻击者必须在Native VLAN内。
+**【修正】攻击前提（关键——默认配置即满足）** ：
 
-**攻击原理（防御性描述，修正版）** ：
+Double Tagging攻击的成立依赖于一个在**绝大多数Cisco交换机默认配置下天然满足**的条件：
+1. 攻击者接入的Access端口的PVID（默认为**VLAN 1**）与第一台交换机连接第二台交换机的Trunk端口的Native VLAN（默认为**VLAN 1**）**相同**；
+2. 该Trunk端口未配置`vlan dot1q tag native`；
+3. 攻击者操作系统需配置VLAN子接口或使用支持构造802.1Q Tag的工具（如Scapy）。
+
+> **由于Cisco交换机的VLAN 1是默认VLAN，上述条件在未加固网络中几乎总是成立**——攻击者只需物理接入任意Access端口即可发起攻击，无需任何特殊配置前提。这正是VLAN 1被称为“高风险VLAN”的根本原因。
+
+**攻击原理（防御性描述）** ：
 
 1. 攻击者构造并发送一个**带有双层802.1Q标签**的以太网帧：
    - **外层Tag** = Native VLAN ID（如VLAN 1）
@@ -140,21 +153,24 @@ interface GigabitEthernet0/1
 
 4. **第二台交换机的Trunk端口**收到该帧，解析出帧中携带的VLAN 20标签，将其视为合法的802.1Q Tag，在VLAN 20内泛洪/转发。攻击成功跨越了VLAN边界。
 
-> **攻击成立的根本原因**：Native VLAN在Trunk出站时不打Tag，导致帧Payload中的残留内层标签"裸露"出来，被第二台交换机误认为有效标签。
+> **攻击成立的根本原因**：Native VLAN在Trunk出站时不打Tag，导致帧Payload中的残留内层标签“裸露”出来，被第二台交换机误认为有效标签。
 
 **关键限制**：
 - 该攻击**仅单向有效**——目标VLAN 20的回程流量携带VLAN 20标签到达第一台交换机的Access端口时，因VID（20）≠ PVID（1）而被丢弃；
 - 仅当Native VLAN未被修改（即保持VLAN 1）且未启用`vlan dot1q tag native`时成立；
-- 攻击者网卡必须支持VLAN Tagging。
+- 攻击者操作系统必须配置VLAN子接口或使用Scapy等工具。
 
 **防御配置（彻底阻断）** ：
 ```cisco
-! 方案1：修改Native VLAN为非默认值，使攻击者无法接入（无法同时满足PVID=Native VLAN）
+! 前置条件：确保VLAN 999已创建并激活
+vlan 999
+
+! 方案1：修改Native VLAN为非默认值，使攻击者无法同时满足PVID=Native VLAN
 interface GigabitEthernet0/24
  switchport trunk native vlan 999
 
 ! 方案2：强制Native VLAN帧携带标签（Cisco专用）
-vlan dot1q tag native   ! 出站Native VLAN帧带标签，使攻击帧在Trunk链路上不再"裸露"
+vlan dot1q tag native   ! 出站Native VLAN帧带标签，使攻击帧在Trunk链路上不再“裸露”
 ! 注意：该全局命令与接口级native vlan命令配合时，需确保Native VLAN ID全局一致
 
 ! 方案3：Trunk上限制allowed vlan，最小化攻击面
@@ -189,7 +205,7 @@ switchport trunk allowed vlan 10,20,30,999
 | **VGT** | VM自身识别和处理VLAN标签 | **高风险**——若VM被攻陷，可修改内部VLAN ID访问其他VLAN |
 | **EST** | 物理交换机打标签，vSwitch透传 | 低风险——需物理交换机ACL |
 
-**安全建议**：生产环境强制使用VST模式（在vSphere端口组中设置VLAN ID，选择"VLAN"类型而非"VLAN Trunk"）。禁用VGT模式，或通过vCenter权限限制仅允许特定VM使用VGT。
+**安全建议**：生产环境强制使用VST模式（在vSphere端口组中设置VLAN ID，选择“VLAN”类型而非“VLAN Trunk”）。禁用VGT模式，或通过vCenter权限限制仅允许特定VM使用VGT。
 
 ### 8.2 容器网络
 
@@ -202,9 +218,9 @@ switchport trunk allowed vlan 10,20,30,999
 
 VLAN是现代网络隔离的基石，也是内网渗透中攻击者首要突破的边界。理解802.1Q标签格式、Access/Trunk端口行为、Native VLAN收发双向机制，是构建二层安全防御体系的基础。
 
-攻击者通过DTP协商滥用可将Access端口提升为Trunk，通过构造双层标签帧利用Native VLAN的"出站不打Tag"机制实施Double Tagging注入——但在配置了"强制Access + Native VLAN修改 + `vlan dot1q tag native` + VLAN过滤"的加固网络中，这些攻击均被有效阻断。
+攻击者通过DTP协商滥用可将Access端口提升为Trunk，通过构造双层标签帧利用Native VLAN的“出站不打Tag”机制实施Double Tagging注入——但在配置了“强制Access + Native VLAN修改 + `vlan dot1q tag native` + VLAN过滤”的加固网络中，这些攻击均被有效阻断。
 
-**关键认知**：VLAN仅提供二层隔离，一旦启用三层路由（`ip routing`），各VLAN SVI之间默认互通，必须通过**ACL或防火墙策略**显式控制跨VLAN流量。安全隔离是"二层VLAN划分 + 三层ACL控制"的组合产物，缺一不可。
+**关键认知**：VLAN仅提供二层隔离，一旦启用三层路由（`ip routing`），各VLAN SVI之间默认互通，必须通过**ACL或防火墙策略**显式控制跨VLAN流量。安全隔离是“二层VLAN划分 + 三层ACL控制”的组合产物，缺一不可。
 
 下一步，建议将VLAN知识与MAC地址表、STP、ARP安全串联，构建完整的二层安全知识体系。
 
