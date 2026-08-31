@@ -38,13 +38,13 @@
 | 路由来源 | Cisco AD | 华为Preference | Juniper Preference |
 |:---|:---:|:---:|:---:|
 | 直连 | 0 | 0 | 0 |
-| 静态 | 1 | 60 | 5 |
+| 静态 | 1 | 60（**可配置**，范围1-255） | 5 |
 | eBGP | 20 | 255 | 170 |
 | OSPF | 110 | **10** | 10 |
 | RIP | 120 | 100 | 100 |
 | iBGP | 200 | 255 | 170 |
 
-> **⚠️ 排障关键**：跨厂商环境中，**OSPF在华为设备（Preference=10）比静态路由（Preference=60）更优**，而在Cisco中静态路由（AD=1）比OSPF（AD=110）更优。排障时必须先确认设备厂商。
+> **⚠️ 排障关键**：跨厂商环境中，**OSPF在华为设备（Preference=10）比静态路由（Preference=60）更优**，而在Cisco中静态路由（AD=1）比OSPF（AD=110）更优。排障时必须先确认设备厂商。**华为静态路由的Preference值可配置**，生产环境中可能已被调整，排障前应通过`display current-configuration | include preference`确认实际值。
 
 ### 2.2 匹配算法：最长前缀匹配（LPM）
 
@@ -59,6 +59,8 @@
 
 OSPF通过组播（224.0.0.5/6）发送Hello包建立邻居关系。它**默认信任邻居，且认证常被忽略**。
 
+**OSPF邻居状态机（快速参考）** ：Down → Init → 2-Way → Exstart → Exchange → Loading → Full。攻击者需与合法路由器建立到Full邻接关系才能注入LSA。
+
 #### 攻击手法：OSPF邻居欺骗 + LSA注入
 1. 攻击者在内网拿下一台服务器，开启IP转发。
 2. 伪造OSPF Hello报文，宣称自己是“骨干区域”可信路由器。
@@ -66,7 +68,9 @@ OSPF通过组播（224.0.0.5/6）发送Hello包建立邻居关系。它**默认�
 4. 攻击者发布LSA，宣称自己连接了目标网段且Metric=1。
 5. **效果**：所有去往目标网段的流量被引向攻击机，实现MITM。
 
-> **⚠️ 风险提示**：LSA注入攻击需在**授权内网测试环境**中执行，注入虚假LSA可能导致全网路由震荡，影响业务。
+> **⚠️ 攻击有效性边界**：上述MITM效果仅在**目标网段的合法路由来源为OSPF（AD=110）且攻击者注入的LSA Metric小于合法Metric**时成立。若目标网段存在**静态路由（AD=1）或直连路由（AD=0）** ，OSPF LSA注入**无法覆盖**。在Cisco环境中，静态路由优先于OSPF路由。
+
+> **⚠️ 风险提示**：LSA注入攻击需在**授权内网测试环境**中执行，注入虚假LSA可能导致全网路由震荡，影响业务。测试前准备好`clear ip ospf process`等恢复命令。
 
 #### 防御配置（2026年生产标准）
 
@@ -81,20 +85,22 @@ key chain OSPF-KEY
 router ospf 1
  router-id 10.0.0.1
  area 0 authentication message-digest
- passive-interface default                ! 所有接口默认被动（不发送Hello）
+ passive-interface default                ! ✅ 正确位置：全局配置模式
  no passive-interface GigabitEthernet0/1  ! 仅邻居接口放行
 !
 ! 3. 接口配置（激活OSPF和TTL安全GTSM）
 interface GigabitEthernet0/1
  ip ospf authentication key-chain OSPF-KEY
- ip ospf ttl-security hops 1              ! 仅接受TTL=255的OSPF包（RFC 5082 GTSM）
+ ip ospf ttl-security hops 1              ! GTSM（RFC 5082），要求TTL ≥ 254，拒绝非直连邻居
  ip ospf 1 area 0
 ```
 
 > **配置说明**：
-> - `passive-interface` 是**全局配置命令**（在`router ospf`下），**不能**放在接口配置块中；
-> - `ip ospf ttl-security`是接口命令，`hops 1`表示仅接受TTL=254以上（实际上`hops`参数的含义是“允许的最大跳数差”，默认1表示TTL必须为255）。若需精确控制，可配置`ip ospf ttl-security hops <1-254>`；
+> - `passive-interface default`是**全局配置命令**（在`router ospf`下），**不能**放在接口配置块中；
+> - `ip ospf ttl-security hops 1` — 要求接收的OSPF包TTL ≥ (255 - hops) = 254，**拒绝非直连邻居（TTL < 254）的OSPF报文**；
 > - 若邻居间MTU不一致，OSPF邻居可能卡在ExStart状态，可用`ip ospf mtu-ignore`解决（仅限测试环境）。
+
+**验证命令**：`show ip ospf neighbor`、`show ip ospf interface`（确认认证和GTSM生效）。
 
 ### 3.2 BGP —— 互联网的“命脉”与“劫持重灾区”
 
@@ -104,12 +110,12 @@ interface GigabitEthernet0/1
 
 **⚠️ RPKI的局限性**：RPKI仅验证**源AS**合法性，不验证**路径**合法性。攻击者若在AS_PATH中插入合法源AS但篡改中间AS路径，仍可能绕过RPKI检测。BGPsec（RFC 8205）提供了路径验证能力，但部署率极低。
 
-**Cisco IOS XE 16.12+配置示例**：
+**Cisco IOS XE配置示例**：
 ```cisco
 router bgp <AS_NUMBER>
  bgp rpki server tcp 192.0.2.1 port 323 refresh 600
- bgp bestpath origin-as use rpki        ! IOS XE 16.12+语法
- ! 注：部分版本中需使用 bgp bestpath origin-as validate，请以设备文档为准
+ bgp bestpath origin-as use rpki        ! IOS XE 16.12.1+ 语法
+ ! IOS XE 16.12之前版本使用: bgp bestpath origin-as validate
 ```
 
 **验证命令**：`show bgp rpki table` 查看ROA验证状态。
@@ -122,7 +128,13 @@ router bgp <AS_NUMBER>
 > ⚠️ **注意**：现代Windows Vista+和较新Linux内核默认已禁用ICMP重定向接收，此攻击**仅在特定老旧设备或未加固终端上有效**。
 
 - **原理**：攻击者发送伪造的ICMP Type 5，告诉受害者“去往目标走我这更快”。受害者路由表插入临时主机路由，流量被劫持。
-- **防御（终端侧）** ：`net.ipv4.conf.all.accept_redirects = 0`（Linux）；Windows注册表`EnableICMPRedirect=0`。
+- **防御（终端侧，完整接收+发送）** ：
+  ```bash
+  # Linux：禁用接收和发送ICMP重定向
+  sysctl -w net.ipv4.conf.all.accept_redirects=0
+  sysctl -w net.ipv4.conf.all.send_redirects=0      # 防止本机被用作重定向攻击跳板
+  ```
+  **Windows注册表**：`HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\EnableICMPRedirect` = 0（禁用接收），发送重定向在Windows中默认不开启。
 
 ### 4.2 策略路由（PBR）绕过
 
@@ -169,6 +181,10 @@ ip prefix-list MATCH-RANGE seq 5 permit 10.0.0.0/8 ge 16 le 24
 
 - **原理**：一台物理路由器上维护多个独立路由表，不同VRF间路由**默认隔离**。
 - **安全提醒**：VRF间可通过**路由泄漏（Route Leaking）** 或VRF间静态路由实现互通。在生产环境中，路由泄漏是常见运维需求（如管理VRF访问业务VRF），需使用独立route-map精确控制泄漏范围，避免将敏感路由意外泄露到不安全VRF。
+- **VRF路由泄漏的工程实现与安全风险**：
+  - **静态泄漏**：`ip route vrf A 10.0.0.0/24 vrf B 192.168.1.1`——将VRF A中的路由泄漏到VRF B，**需注意避免双向泄漏导致路由环路**；
+  - **MP-BGP泄漏**：通过`route-target export/import`控制VRF间的路由交换，**需严格审计Route-Target配置**，避免过度泄漏；
+  - **安全基线**：泄漏时应使用`route-map`精确过滤，仅泄漏必要路由（如`deny`敏感管理网段）。
 - **红队视角**：若拿下VRF A中的设备，需通过VRF间路由泄漏配置漏洞才能横向移动至VRF B，难度较高。
 - **安全价值**：VRF结合MPLS是实现数据中心多租户隔离与网络微分段的核心技术。
 
@@ -179,9 +195,9 @@ ip prefix-list MATCH-RANGE seq 5 permit 10.0.0.0/8 ge 16 le 24
 |:---|:---|:---|
 | OSPF认证 | HMAC-SHA-256优先 | `show ip ospf interface` |
 | OSPF TTL安全（GTSM） | 直连邻居间启用 | `show ip ospf interface` |
-| uRPF严格模式 | 边界接口启用 | `show ip verify source`（或`show ip verify unicast source`，视平台） |
+| uRPF严格模式 | 边界接口启用 | `show ip verify unicast source` |
 | BGP RPKI | 启用ROA验证 | `show bgp rpki table` |
-| ICMP重定向禁用 | 终端侧`accept_redirects=0` | `sysctl net.ipv4.conf.all.accept_redirects` |
+| ICMP重定向禁用 | 终端侧`accept_redirects=0`、`send_redirects=0` | `sysctl net.ipv4.conf.all.accept_redirects` |
 
 
 ## 八、进阶延伸：OSPF排障快速决策树
