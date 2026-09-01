@@ -23,13 +23,13 @@ TCP是“流”协议——它将应用层数据切成字节，给每个字节�
 
 | 字段 | 大小 | 含义 | 攻防意义 |
 |:---|:---:|:---|:---|
-| **Sequence Number（SEQ）** | 32位 | 本报文段第一个字节的编号 | 可预测性导致会话劫持（ISN随机化是关键防御——RFC 1948/6528） |
+| **Sequence Number（SEQ）** | 32位 | 本报文段第一个字节的编号 | 可预测性导致会话劫持——**RFC 1948（1996）提出MD5杂凑方案，RFC 6528（2012）正式取代并强制要求加密安全的ISN随机化**，现代OS已实现RFC 6528标准 |
 | **Acknowledgment Number（ACK）** | 32位 | 期待对方下次发来的第一个字节编号（累积确认） | 判断丢包、重传、SACK的基准 |
 | **Flags** | 9位 | SYN/ACK/FIN/RST等连接状态控制 | SYN Flood、RST攻击的核心目标 |
 | **Window Size** | 16位 | 接收方可用缓冲区大小（流量控制） | 配合Window Scale（RFC 7323）可扩展至~1GB，可被利用于侧信道观测 |
 | **Checksum** | 16位 | 覆盖伪头部（含IP）+TCP头+数据 | NAT修改IP/端口后必须重算，是CPU消耗主因 |
 
-**Wireshark抓包冷知识**：你看到的 `Seq=0, Ack=0` 是**相对值**（Wireshark默认启用`seq/ack`相对化）。实际线上传输的是32位随机绝对值，现代OS已实现ISN随机化，防止攻击者预测。
+**Wireshark抓包冷知识**：你看到的 `Seq=0, Ack=0` 是 **相对值**（Wireshark默认启用`seq/ack`相对化）。实际线上传输的是32位随机绝对值，现代OS已实现ISN随机化。
 
 
 ## 三、连接建立（三次握手）——为什么必须是三次？
@@ -74,14 +74,18 @@ TCP是“流”协议——它将应用层数据切成字节，给每个字节�
 
 ### 4.3 超时重传（RTO）与SACK
 
-TCP估算平滑RTT（SRTT）和偏差（RTTVAR），`RTO = SRTT + 4 × RTTVAR`（RFC 6298）。**SACK（RFC 2018）** 允许接收方明确告知已接收字节范围，使发送方只重传缺失段，减少冗余。
+TCP估算平滑RTT（SRTT）和偏差（RTTVAR），**RFC 6298推荐** `RTO = SRTT + 4 × RTTVAR`。Linux实现中RTO下限为`tcp_rto_min`（默认200ms），上限为`tcp_rto_max`（默认120秒）。**SACK（RFC 2018）** 允许接收方明确告知已接收字节范围，使发送方只重传缺失段，减少冗余。
 
 
 ## 五、连接关闭（四次挥手）与TIME_WAIT
 
 ### 为什么主动方必须等2MSL？
 
-最后一次ACK可能丢失，被动方会重发FIN。2MSL确保本次连接所有报文在网络中消失。RFC 793建议MSL=2分钟（2MSL=4分钟），但**Linux内核硬编码`TCP_TIMEWAIT_LEN`为60秒**，生产环境调优需以此为基准。
+最后一次ACK可能丢失，被动方会重发FIN。2MSL确保本次连接所有报文在网络中消失。RFC 793建议MSL=2分钟（2MSL=4分钟）。
+
+**Linux TIME_WAIT超时值**：
+- **传统行为（4.x及之前）** ：内核硬编码`TCP_TIMEWAIT_LEN`为60秒；
+- **现代内核（5.x+）** ：可通过`net.ipv4.tcp_tw_timeout`调整（默认60秒）。Ubuntu 22.04（内核5.15）支持此参数。
 
 ### 生产环境调优（高并发短连接服务器）
 ```bash
@@ -101,20 +105,28 @@ net.ipv4.tcp_max_tw_buckets = 5000   # 超过后立即销毁（慎用，可能�
 
 - **原理**：发送大量SYN包不发ACK，耗尽半连接队列（`tcp_max_syn_backlog`）。
 - **防御**：`net.ipv4.tcp_syncookies = 1`。服务端不分配半连接表项，将连接信息编码为SYN+ACK的seq号。
-- **现代内核（4.9+）演进**：SYN Cookie通过协同TCP Timestamp选项编码，已实现对**Window Scaling的有限支持**，但SACK和TFO仍可能受限（取决于内核版本）。**高吞吐场景建议同时调大半连接队列**（`net.core.somaxconn`和`tcp_max_syn_backlog`）以降低对SYN Cookie的性能依赖。
+- **现代内核（4.x+）演进**：SYN Cookie通过协同TCP Timestamp选项编码，已实现与Window Scaling的**兼容**：
+
+| 内核版本 | 对Window Scaling的支持 | 对其他特性的影响 |
+|:---|:---|:---|
+| **Linux 4.9–4.13** | **有限支持**：可编码部分窗口缩放因子（受Timestamp字段位数限制） | SACK/TFO可能受限 |
+| **Linux 4.14+** | **较好支持**：高效编码完整Window Scaling，同时保留Timestamp | SACK兼容性持续改进 |
+| **Linux 5.x（最新）** | **完整兼容**：在多数场景下可同时启用SYN Cookie和Window Scaling | 建议在生产环境中测试验证 |
+
+> **调优建议**：高吞吐场景建议**同时调大半连接队列**（`net.core.somaxconn`和`tcp_max_syn_backlog`）以降低对SYN Cookie的性能依赖，而非盲目禁用SYN Cookie。生产环境中调整参数前建议在测试环境中模拟SYN Flood流量验证防御效果。
 
 ### 6.2 攻击面2：TCP RST攻击（会话中断）
 
 - **原理**：攻击者嗅探五元组，猜中序列号范围，伪造RST包强制断连（前提：已获内网嗅探能力）。
 - **防御纵深**：
   - **TCP-AO（RFC 5925）** ：密码学签名保护（适用于BGP等关键TCP连接，部署成本高）；
-  - **RFC 5961 Challenge ACK（Linux内核3.6+默认启用）** ：收到疑似非法RST/数据包时，发送Challenge ACK要求对方确认序列号（`net.ipv4.tcp_challenge_ack_limit=100`控制速率）；
-  - **RFC 1337 TIME-WAIT保护（`net.ipv4.tcp_rfc1337=1`）** ：保护TIME-WAIT状态的连接免遭RST终止（与RFC 5961是两套独立机制）；
+  - **RFC 5961 Challenge ACK（Linux内核3.6+默认启用）** ：保护**ESTABLISHED状态**连接，收到疑似非法RST/数据包时发送Challenge ACK要求对方确认序列号（`net.ipv4.tcp_challenge_ack_limit=100`控制速率）；
+  - **RFC 1337 TIME-WAIT保护（`net.ipv4.tcp_rfc1337=1`）** ：保护**TIME-WAIT状态**连接，不接受非精确匹配的RST——**与RFC 5961协同工作，分别保护TCP连接生命周期的不同阶段**；
   - **内网DAI**阻断ARP欺骗切断嗅探前提。
 
 ### 6.3 攻击面3：TCP会话劫持（ISN预测）
 
-若ISN可预测，攻击者可伪造ACK注入数据。现代OS采用RFC 1948/6528 ISN随机化（随机偏移+时间戳杂凑），预测几乎不可能。
+若ISN可预测，攻击者可伪造ACK注入数据。现代OS采用RFC 6528 ISN随机化（加密安全PRNG），预测几乎不可能。
 
 ### 6.4 攻击面4：端口扫描（内网横向探测）
 
@@ -123,7 +135,12 @@ net.ipv4.tcp_max_tw_buckets = 5000   # 超过后立即销毁（慎用，可能�
 
 ### 6.5 攻击面5：TCP选项隐蔽信道
 
-攻击者可将数据编码在TCP Timestamp选项（TSval字段的LSB位）或TCP序列号的特定偏差中，在合规流量中夹带指令。检测上需关注Timestamps字段的熵值异常或序列号偏差的统计异常（需NDR设备支持）。
+攻击者可将数据编码在TCP Timestamp选项（TSval字段的LSB位）或TCP序列号的特定偏差中，在合规流量中夹带指令。
+
+**⚠️ TCP选项隐蔽信道检测的可操作方法**：
+- **Timestamp字段检测**：正常TCP连接的TSval应呈现**平滑递增**（增量≈RTT微秒级差）。若在短时间内观察到TSval出现**异常大幅跳跃**（如从1000跳到1000000后再回到1001）或**LSB位呈现固定模式**（如始终为0或1），应触发告警；
+- **序列号偏差检测**：正常TCP连接的SEQ增量应**等于已发送数据字节数**。若观察到ACK包中的Ack字段与预期值存在**系统性偏差**（如每次偏差+1或+2），可能暗示隐蔽数据编码；
+- **开源工具支持**：Wireshark的`tcp.timestamp`过滤可用于初步观察，但精细化检测建议使用Zeek脚本（实现滑动窗口TSval差值分析）或Suricata的自定义规则。
 
 ### 6.6 攻击面6：SACK漏洞引发的内核DoS
 
@@ -160,7 +177,7 @@ ESTABLISHED -> (被动关闭/收到FIN) -> CLOSE_WAIT -> (发FIN) -> LAST_ACK ->
 
 - **SMB横向移动（TCP 445）** ：若防火墙仅允许80/443出站，可用SSH隧道或SOCKS代理将445映射到内网目标。
 - **Kerberos（TCP/UDP 88）** ：Wireshark可过滤`tcp.port == 88`，但**票据（Ticket）和认证数据均为加密字段**，需拥有目标服务密钥（keytab）才能解密。红队场景中通过**mimikatz/Rubeus**从内存提取票据（TGT/TGS）进行Pass-the-Ticket攻击。
-- **RDP（TCP 3389）** ：CredSSP（NLA）在TCP握手后直接嵌套TLS，在TLS隧道内封装SPNEGO（Kerberos/NTLM）进行预认证。Wireshark无法直接解密TLS内的哈希，需提取外层NTLM Type消息离线爆破。
+- **RDP（TCP 3389）** ：CredSSP（NLA）在TCP握手后直接嵌套TLS，在TLS隧道内封装SPNEGO（Kerberos/NTLM）进行预认证。**若拥有TLS私钥**，可通过Wireshark导入私钥或配置SSLKEYLOGFILE解密TLS流量后看到内部SPNEGO消息；**若无私钥**，则无法解密TLS内的哈希，需提取外层NTLM Type消息离线爆破。
 
 
 ## 九、TCP协议安全基线检查清单
@@ -194,11 +211,11 @@ ESTABLISHED -> (被动关闭/收到FIN) -> CLOSE_WAIT -> (发FIN) -> LAST_ACK ->
 ## 十一、参考资料
 
 1. **RFC 793** — *Transmission Control Protocol*（1981），J. Postel
-2. **RFC 1948** — *Defending Against Sequence Number Attacks*（1996），S. Bellovin
-3. **RFC 5961** — *Improving TCP's Robustness to Blind In-Window Attacks*（2010），A. Ramaiah et al.
-4. **RFC 6298** — *Computing TCP's Retransmission Timer*（2011），V. Paxson et al.
-5. **RFC 8312** — *CUBIC for Fast Long-Distance Networks*（2018），I. Rhee et al.
-6. **RFC 6528** — *Defending against Sequence Number Attacks*（2012），S. Bellovin et al.
+2. **RFC 1948** — *Defending Against Sequence Number Attacks*（1996），S. Bellovin（**已被RFC 6528废弃**）
+3. **RFC 5961** — *Improving TCP‘s Robustness to Blind In-Window Attacks*（2010），A. Ramaiah et al.
+4. **RFC 6298** — *Computing TCP’s Retransmission Timer*（2011），V. Paxson et al.
+5. **RFC 6528** — *Defending against Sequence Number Attacks*（2012），S. Bellovin et al.（**取代RFC 1948**）
+6. **RFC 8312** — *CUBIC for Fast Long-Distance Networks*（2018），I. Rhee et al.
 7. **MITRE ATT&CK** — [T1046: Network Service Scanning](https://attack.mitre.org/techniques/T1046/)，[T1572: Protocol Tunneling](https://attack.mitre.org/techniques/T1572/)
 
 
