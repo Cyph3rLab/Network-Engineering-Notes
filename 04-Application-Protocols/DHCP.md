@@ -29,7 +29,7 @@ DHCP是内网攻击链的**第一环**——控制DHCP，就控制了“身份�
 
 DHCP Discover是广播帧，无法跨越VLAN边界。解决方案是配置**DHCP Relay**（`ip helper-address`）。
 
-**`ip helper-address`默认转发的8种UDP广播协议（Cisco）** ：
+**`ip helper-address`默认转发的UDP广播协议（Cisco）** ：
 
 | 协议 | 端口 | 是否需要跨VLAN转发 |
 |:---|:---:|:---|
@@ -40,8 +40,11 @@ DHCP Discover是广播帧，无法跨越VLAN边界。解决方案是配置**DHCP
 | TACACS | 49 | 极少 |
 | NetBIOS Name Service | 137 | ⚠️ 高风险（易产生广播扩散） |
 | NetBIOS Datagram | 138 | ⚠️ 高风险（易产生广播扩散） |
+| **RIP路由协议** | **520** | ❌ **不需要**（意外转发可能导致路由信息泄露） |
 
-> **⚠️ 跨VLAN转发NetBIOS的风险与精确控制**：转发NetBIOS（UDP 137/138）会增加跨VLAN广播流量。若源VLAN内存在大量Windows主机且未禁用NetBIOS over TCP/IP，广播流量将被扩散到其他VLAN，增加跨VLAN带宽负担和CPU负载。生产环境中，若无需跨VLAN NetBIOS解析，应使用`no ip forward-protocol udp 137`和`no ip forward-protocol udp 138`精确关闭NetBIOS转发。
+> **⚠️ 跨VLAN转发NetBIOS/RIP的风险与精确控制**：
+> - **NetBIOS（UDP 137/138）** ：若源VLAN内存在大量Windows主机且未禁用NetBIOS over TCP/IP，广播流量将被扩散到其他VLAN，增加跨VLAN带宽负担。应使用`no ip forward-protocol udp 137`和`no ip forward-protocol udp 138`精确关闭。
+> - **RIP（UDP 520）** ：若网络未使用RIP路由协议，应使用`no ip forward-protocol udp 520`关闭其转发，避免路由信息意外泄露。
 
 
 ## 四、DORA流程详解（附Option 54关键细节）
@@ -85,6 +88,8 @@ DORA是DHCP最重要的概念：**Discover → Offer → Request → Acknowledge
 
 攻击者先耗尽合法服务器地址池，使新客户端无法获取IP。随后部署Rogue DHCP Server响应请求。因合法服务器无竞争，客户端被迫接受恶意配置（如被分配攻击者IP作为网关/DNS），实现隐蔽MITM。
 
+**攻击者需持续响应**：客户端在首次获取IP失败后可能进入APIPA状态（169.254.x.x）并周期性重试。Rogue DHCP Server应**持续运行并快速响应Discover**，确保在客户端每次重试时都能抢占。
+
 ### 6.3 DHCP Release伪造攻击（踢人下线）
 
 - **原理**：伪造目标MAC地址发送DHCP Release报文。
@@ -96,7 +101,7 @@ DORA是DHCP最重要的概念：**Discover → Offer → Request → Acknowledge
 - **协议澄清**：该攻击利用IPv6无状态地址自动配置（SLAAC，RFC 4861）中的RA（Router Advertisement）机制，**属于ICMPv6范畴，而非DHCPv6协议**。
 - **攻击原理**：攻击者发送伪造的ICMPv6 RA，宣称自己的链路本地地址为默认网关。可通过两种方式诱导客户端：
   - **方式一**：设置`Router Lifetime`为较大值（如9000秒），使客户端长期将攻击者视为默认网关；
-  - **方式二**：发送`Router Lifetime = 0`的RA撤销合法网关（需结合攻击者自身的RA进行覆盖）。
+  - **方式二**：发送`Router Lifetime = 0`的RA**（须伪造合法网关的源链路本地地址）** ，使客户端**从默认网关列表中移除该合法网关**。单独以攻击者自身源地址发送`Lifetime=0`的RA，仅使客户端将攻击者自身从网关列表中移除（几乎无攻击效果）。
   `Default Router Preference`（RFC 4191可选字段）可辅助提高攻击者路由的优先级，但**并非所有客户端都支持**，不应作为唯一手段。
 - **防御**：启用**IPv6 RA Guard**（`ipv6 nd raguard`）。
 
@@ -114,6 +119,7 @@ DORA是DHCP最重要的概念：**Discover → Offer → Request → Acknowledge
 **Option 82与DHCP Snooping的联动（跨VLAN场景）** ：
 当DHCP Relay转发Discover时，会插入Option 82（RFC 3046），包含`Circuit ID`（接入端口标识）和`Remote ID`（交换机标识）。DHCP Snooping结合Option 82可精确定位DHCP请求来源，防止攻击者在同一交换机不同端口间伪造MAC地址。
 ```cisco
+! 全局配置模式
 ip dhcp snooping information option
 ip dhcp snooping vlan 10,20
 ```
@@ -122,16 +128,30 @@ ip dhcp snooping vlan 10,20
 
 非信任端口配置DHCP报文速率上限（如10 pps）并限制MAC数量，从源头阻止Starvation填满绑定表或CAM表。
 
+> **⚠️ 限速阈值评估**：配置`ip dhcp snooping limit rate`前需评估环境中是否存在合法高DHCP请求频率的场景（如大量IoT设备批量上线），过度限速可能导致合法设备无法获取IP。建议根据实际业务峰值调整。
+
 ### 7.3 DAI（Dynamic ARP Inspection）与IPSG（IP Source Guard）
 
 - **DAI**：结合DHCP Snooping绑定表，校验ARP报文的IP/MAC合法性，阻止Rogue Server下发的恶意网关ARP解析。
 - **IPSG**：在交换机端口上仅允许绑定表中的IP+MAC组合通过，阻断Rogue DHCP Server分配的错误IP在终端上的使用。
 
-> **⚠️ 绕过DHCP Snooping的对抗（关键区别）** ：当绑定表被Starvation填满时，不同厂商设备行为不同——
+> **⚠️ 静态IP场景避坑（关键）** ：
+> DAI和IPSG依赖DHCP Snooping绑定表，若终端配置静态IP，绑定表中无记录，默认DAI/IPSG会丢弃该终端的ARP/IP包。
+> **解决方案**：
+> 1. **ARP ACL放行**（推荐）：
+>    ```cisco
+>    arp access-list STATIC-HOST
+>     permit ip host 10.0.10.50 mac host 0050.56a1.b2c3
+>    ip arp inspection filter STATIC-HOST vlan 10
+>    ```
+> 2. **端口信任**（不推荐，会完全绕过DAI/IPSG防御）：`ip arp inspection trust` / `ip verify source trust`。
+> 生产环境中，静态IP终端应优先采用方案1。
+
+> **⚠️ 绕过DHCP Snooping的对抗（关键区别）** ：当绑定表被Starvation填满时，不同厂商设备行为可能存在差异——
 > - **Cisco Catalyst**：默认**fail-close**（新DHCP请求被丢弃）；
-> - **华为S系列（部分型号）** ：默认**fail-open**（允许新DHCP请求通过，需显式配置`dhcp snooping user-bind max-number`限制绑定表大小）。
-> 
-> 因此，**限速配置是绝对前提**，不应依赖设备默认行为。
+> - **华为S系列**：**缺省行为因型号和软件版本而异**，建议通过`dhcp snooping user-bind max-number`显式配置绑定表上限，并测试满后的设备行为。
+>
+> **因此，限速配置是绝对前提**，不应依赖设备默认行为。
 
 
 ## 八、DHCP协议安全基线检查清单
@@ -144,7 +164,7 @@ ip dhcp snooping vlan 10,20
 | DAI联动 | 绑定表存在且一致 | `show ip dhcp snooping binding` |
 | IPSG启用 | 接入端口启用IP+MAC校验 | `show ip verify source interface Gi0/1` |
 | IPv6 RA Guard | 启用（如需IPv6） | `show ipv6 nd raguard` |
-| Relay精确控制 | 移除UDP 137/138转发 | `show run \| include forward-protocol` |
+| Relay精确控制 | 移除UDP 137/138/520转发 | `show run \| include forward-protocol` |
 | 绑定表容量 | 显式配置上限，避免fail-open | `ip dhcp snooping binding max-number` |
 
 
@@ -167,8 +187,8 @@ tcpdump -i eth0 -nn 'udp port 67 or udp port 68' -w dhcp.pcap
 
 **关键澄清**：
 - **Starvation导致CAM表溢出需同时伪造以太网帧源MAC**（而非仅伪造DHCP `chaddr`），两者是不同协议层的操作；
-- **`ip helper-address`转发NetBIOS的风险**取决于源VLAN内NetBIOS流量大小，需精确控制`no ip forward-protocol`而非一刀切；
-- **IPv6 RA欺骗**的核心机制是RA中的`Router Lifetime`字段，`Default Router Preference`为可选扩展，非所有客户端支持。
+- **`ip helper-address`转发NetBIOS/RIP的风险**需精确控制`no ip forward-protocol`而非一刀切；
+- **IPv6 RA欺骗**的核心机制是RA中的`Router Lifetime`字段——`Lifetime=0`撤销合法网关**须伪造合法网关的源地址**，单独以攻击者地址发送无效。
 
 防御方需部署**DHCP Snooping + 限速 + Port Security + DAI + IPSG**的五层组合，并务必检查IPv6安全策略是否为空白（RA Guard）。下一步，建议将DHCP与ARP欺骗、DNS劫持串联，构建完整的网络层与应用层联动防御视角。
 
