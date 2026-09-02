@@ -46,7 +46,15 @@ IP分片（MTU：通常1500字节）—— 网络层
 | `User-Agent` | 伪造绕过WAF规则（建议WAF结合行为分析而非依赖UA）。 |
 | `Cookie` | 窃取后Session Hijacking。防御：`HttpOnly` + `Secure` + `SameSite`属性。 |
 | `Referer` | 敏感信息泄露或绕过防盗链。防御：不依赖Referer做权限校验。 |
-| `X-Forwarded-For` | IP伪造绕过ACL。**防御**：配置可信代理链，使用Nginx `real_ip`模块提取真实IP——`real_ip_recursive on`从右向左过滤信任代理，提取真实客户端IP。 |
+| `X-Forwarded-For` | IP伪造绕过ACL。**防御**：配置可信代理链。Nginx `real_ip`模块完整配置——`set_real_ip_from`定义信任代理IP范围，`real_ip_recursive on`从右向左过滤信任代理，提取真实客户端IP。 |
+
+**Nginx `real_ip`模块完整配置**：
+```nginx
+set_real_ip_from 10.0.0.0/8;           # 信任代理IP范围
+set_real_ip_from 192.168.0.0/16;
+real_ip_header X-Forwarded-For;         # 从哪个头提取IP
+real_ip_recursive on;                   # 从右向左过滤信任代理
+```
 
 ### B. 响应报文
 
@@ -81,9 +89,13 @@ location / {
 |:---|:---|:---|
 | **HTTP/1.1** | 持久连接、Host头强制 | 队头阻塞；请求走私风险（CL/TE解析冲突） |
 | **HTTP/2** | 二进制分帧、多路复用、HPACK | HPACK动态表膨胀攻击（内存消耗）；Rapid Reset DoS（CVE-2023-44487） |
-| **HTTP/3** | 弃用TCP，改用QUIC | 0-RTT重放攻击风险（需幂等性校验） |
+| **HTTP/3** | 弃用TCP，改用QUIC（RFC 9114，2022年正式发布） | 0-RTT重放攻击风险（需幂等性校验） |
 
-> **HPACK Bomb说明**：攻击者在多个请求中发送相同头部键名但不同值，强制服务器维护庞大的HPACK动态压缩表，消耗内存资源导致OOM。防御：配置`http2_max_requests`限制单连接请求数。
+> **HPACK Bomb说明**：攻击者在多个请求中发送相同头部键名但不同值，强制服务器维护庞大的HPACK动态压缩表，消耗内存资源导致OOM。
+> **防御**：
+> - **限制HPACK动态表大小**：`http2_max_field_size`和`http2_max_header_size`（Nginx）限制单请求头部字段和总头部大小；
+> - **限制单连接请求数**：`http2_max_requests`（Nginx）限制单连接请求总数，**可限制攻击者通过大量请求逐步膨胀表的能力**，但不能完全防御“单请求引爆”型攻击；
+> - **限制单连接并发流**：`http2_max_concurrent_streams`控制并发流数量。
 >
 > **HTTP/3 0-RTT重放攻击说明**：QUIC的0-RTT数据在握手完成前发送，攻击者可截获并重放请求，导致服务器非幂等操作（如支付接口）被重复执行。防御：要求0-RTT请求实现幂等性校验或独立重放防护。
 
@@ -103,9 +115,9 @@ location / {
 ### 6.3 CSRF（跨站请求伪造）
 
 - **原理**：浏览器自动携带Cookie。
-- **防御**：Anti-CSRF Token（提交时校验）或 `SameSite=Lax/Strict`。注意：`SameSite=None`需同时设置`Secure`属性，且老旧浏览器（Safari 12-）可能不支持。
+- **防御**：Anti-CSRF Token（提交时校验）或 `SameSite=Lax/Strict`。`SameSite=None`需同时设置`Secure`属性，且**Safari 12及以下版本不支持`SameSite=None`（将降级为`Strict`行为）** ，需结合其它防御手段确保兼容性。
 
-### 6.4 CORS配置风险（区分两种场景）
+### 6.4 CORS配置风险
 
 **❌ 高危配置**：服务器未做白名单校验，**直接将请求头中的`Origin`值反射到`Access-Control-Allow-Origin`响应头中**，且配置`Access-Control-Allow-Credentials: true`。
 
@@ -116,7 +128,7 @@ Access-Control-Allow-Credentials: true
 ```
 后果：任意第三方站点可携带用户的Cookie跨域调用敏感API。
 
-**✅ 非漏洞（浏览器拦截）** ：若服务器配置`Access-Control-Allow-Origin: *`与`Access-Control-Allow-Credentials: true`，浏览器**会直接拒绝**跨域请求。
+**✅ 浏览器CORS拦截（非漏洞）** ：若服务器配置`Access-Control-Allow-Origin: *`与`Access-Control-Allow-Credentials: true`，**浏览器端的`fetch`/`XMLHttpRequest` API会拒绝将响应暴露给JavaScript（抛出CORS错误）** ——HTTP请求本身已到达服务器并返回响应，只是响应被浏览器CORS策略拦截。**注意**：使用非浏览器客户端（如curl、Postman）不会受此限制，因此渗透测试中需区分工具类型判断漏洞是否真实存在。
 
 **防御**：严格校验`Origin`白名单，禁止反射式配置；避免使用`ACAC: true`除非确实需要。
 
@@ -139,12 +151,14 @@ Host: example.com
 Content-Length: 30
 Transfer-Encoding: chunked
 
-0\r\n
-\r\n
-GET /admin/delete?user=admin HTTP/1.1\r\n
-Host: example.com\r\n
-\r\n
+0
+
+GET /admin/delete?user=admin HTTP/1.1
+Host: example.com
+
 ```
+
+> **⚠️ 报文构造精度提示**：`Content-Length: 30`精确计算为“`0`+`\r\n`+`\r\n`+`GET /admin/delete?user=admin HTTP/1.1`+`\r\n`+`Host: example.com`+`\r\n`+`\r\n`”的字节数。实际实验中建议先使用`printf`命令计算精确长度（`printf '0\r\n\r\nGET /admin/delete?user=admin HTTP/1.1\r\nHost: example.com\r\n\r\n' | wc -c`），再设置CL值。
 
 **防御**：
 - 优先使用HTTP/2（消除CL/TE歧义）；
@@ -187,7 +201,7 @@ awk '{print length($7), $7}' access.log | sort -nr | head -10
 ### 标准与RFC
 - **RFC 7230-7235** — *HTTP/1.1 Message Syntax and Routing*（2014年，HTTP/1.1正式规范）
 - **RFC 7540** — *HTTP/2*（2015年）
-- **RFC 9114** — *HTTP/3*（2022年，RFC 9114取代RFC 9114草案）
+- **RFC 9114** — *HTTP/3*（2022年，HTTP/3最终正式标准）
 - **RFC 7469** — *Public Key Pinning (HPKP)*（已废弃，2019年）
 
 ### 安全文档与框架
@@ -199,8 +213,8 @@ awk '{print length($7), $7}' access.log | sort -nr | head -10
 **总结**：HTTP是Web安全的“主战场”。从TCP/IP协议栈的联动视角理解HTTP的传输底座，从报文结构理解攻击载荷的植入方式（Host头注入/CRLF），从版本演进理解性能与安全的博弈（HTTP/2 HPACK/Rapid Reset），从请求走私理解协议解析不一致的高级攻击——这就是完整的HTTP协议攻防知识体系。
 
 **关键澄清**：
-- **CORS的高危配置是“反射Origin + Credentials: true”**，而非`ACAO: * + Credentials: true`（后者被浏览器拦截）；
-- **`X-Forwarded-For`提取真实IP的方向取决于`real_ip_recursive`配置**，默认从最左侧提取，`real_ip_recursive on`从右向左过滤信任代理；
+- **CORS的高危配置是“反射Origin + Credentials: true”**，而非`ACAO: * + Credentials: true`（后者被浏览器拦截响应暴露，但请求本身已到达服务器）；
+- **`X-Forwarded-For`提取真实IP需要完整的`real_ip`模块配置**（`set_real_ip_from` + `real_ip_header` + `real_ip_recursive`），缺一不可；
 - **TRACE/XST在现代浏览器中已被禁止**，禁用仍属纵深防御，但不作为高优先级检查项。
 
 掌握本文内容后，建议读者将HTTP与TCP、DNS、DHCP文章串联，形成完整的“链路层→网络层→传输层→应用层”协议攻防知识图谱。
