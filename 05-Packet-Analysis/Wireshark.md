@@ -37,6 +37,8 @@ Wireshark（前身Ethereal）是一个**免费、开源**的网络协议分析�
 
 > **⚠️ 工程避坑**：虽然BPF语法支持域名解析（如 `host www.example.com`），但强烈建议**不使用域名**。因为抓包前域名被系统解析为IP，一方面可能导致DNS查询本身被过滤掉，另一方面CDN节点的IP动态变化会导致漏抓。推荐先通过 `nslookup` 获取确切IP，再使用IP配置捕获过滤器。
 
+> **⚠️ 新手常见陷阱**：捕获过滤器（BPF）**不支持**协议字段深度匹配（如`tcp.flags.syn==1`、`http.request`）。若在捕获过滤器中输入这些表达式，Wireshark会报错或捕获不到任何包。若需要深度匹配，应在**显示过滤器**中实现。
+
 ### 常用显示过滤器（与前期协议文章联动）
 
 | 过滤目标 | 过滤器表达式 | 联动协议篇 |
@@ -65,7 +67,7 @@ Wireshark（前身Ethereal）是一个**免费、开源**的网络协议分析�
 | 方法 | 适用场景 | 限制与说明 |
 |:---|:---|:---|
 | **SSLKEYLOGFILE** | 客户端可控（浏览器/curl） | 最常用。需配置环境变量，浏览器将预主密钥写入日志（**文件权限建议600**） |
-| **服务器私钥（RSA证书）** | 被动抓包 | **仅限`TLS_RSA_*`密钥交换套件**（RSA用于密钥协商）。若使用DHE/ECDHE等前向保密（PFS）套件（**即使证书是RSA类型**），私钥无法解密 |
+| **服务器私钥** | 被动抓包 | **仅限RSA密钥交换（TLS_RSA_*套件）**。**TLS 1.3已完全移除RSA_Kx**，且现代TLS 1.2部署中ECDHE套件占绝对多数——**该方法在现代环境中几乎不可用** |
 | **TLS代理中间人** | 企业网关解密 | 需部署代理设备并让客户端信任代理根证书（合规性需评估） |
 
 > **⚠️ TLS密钥安全警示**：SSLKEYLOGFILE记录了TLS会话密钥，可解密所有HTTPS流量，属于**超高敏感数据**。配置后请确保文件权限为600（`chmod 600 ssl_keys.log`），分析完成后立即删除，避免密钥泄露导致生产环境的HTTPS流量被恶意解密。
@@ -73,16 +75,23 @@ Wireshark（前身Ethereal）是一个**免费、开源**的网络协议分析�
 ### SSLKEYLOGFILE配置（最常用）
 
 ```bash
-# Linux/macOS（推荐环境变量方式）
+# Linux/macOS
 export SSLKEYLOGFILE=/tmp/ssl_keys.log
-google-chrome
+# 根据安装的浏览器选择对应命令：
+# Google Chrome（Ubuntu/Debian）: google-chrome
+# Google Chrome（Fedora/RHEL）: google-chrome
+# Chromium（Ubuntu/Debian）: chromium-browser
+# Chromium（Fedora/RHEL）: chromium
+# macOS Google Chrome: /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome
 
 # Windows (PowerShell)
 $env:SSLKEYLOGFILE="C:\temp\ssl_keys.log"
 chrome.exe
 ```
 
-**浏览器兼容性**：Chrome/Chromium支持环境变量和`--ssl-key-log-file`参数（前者优先级更高）；Firefox**仅支持**环境变量方式。推荐**统一使用环境变量**以确保跨浏览器兼容性。
+**⚠️ 关键前提**：环境变量必须在**启动浏览器的同一个终端会话中设置**。若从图形界面（如GNOME启动器）启动浏览器，环境变量不会被继承——此时应**从终端**启动浏览器，或通过桌面快捷方式文件设置环境变量。
+
+**浏览器兼容性**：Chrome/Chromium支持环境变量和`--ssl-key-log-file`参数（推荐**统一使用环境变量**以确保跨浏览器兼容性）；Firefox**仅支持**环境变量方式。若使用`--ssl-key-log-file`参数，请确保**目标文件所在目录存在且当前用户有写权限**，否则Chrome可能静默失败（不报错也不生成日志）。
 
 **Wireshark配置**：`Edit → Preferences → Protocols → TLS` → “(Pre)-Master-Secret log filename”填入日志路径。
 
@@ -99,8 +108,11 @@ tshark -i eth0 -f "tcp port 80" -w http_traffic.pcap -c 1000
 
 ### 6.2 实时分析HTTP请求
 ```bash
+# 实时抓取并显示HTTP请求
+# 先用-f粗粒度捕获过滤，再用-Y精筛（降低CPU开销）
 tshark -i eth0 -f "tcp port 80" -Y "http.request" -T fields -e http.host -e http.request.uri
 ```
+**`-Y` vs `-f` 区分**：`-f`（捕获过滤器，BPF语法）在内核层丢弃不需要的包，**减少捕获数据量**；`-Y`（显示过滤器，Wireshark Display Filter语法）在用户层过滤已捕获的包，**灵活但CPU开销更高**。生产环境中建议**组合使用**。
 
 ### 6.3 流量统计与异常检测
 ```bash
@@ -113,6 +125,7 @@ tshark -r capture.pcap -z io,stat,1
 # DNS隧道检测：异常长域名（32位十六进制子域名）
 tshark -r capture.pcap -Y "dns.qry.name matches '.*[0-9a-f]{32}.*'" -T fields -e dns.qry.name
 ```
+**检测覆盖范围**：该正则匹配32位十六进制子域名——典型于**dnscat2的16进制编码模式**。iodine的Base32编码子域名呈`[a-z0-9]`字符集（长度不固定），需配合其他特征（TXT查询频率、熵值）综合判定，不能依赖单规则覆盖所有隧道变种。
 
 ### 6.4 捕获文件切片与合并
 ```bash
@@ -161,8 +174,8 @@ mergecap -w merged.pcap file1.pcap file2.pcap
 **总结**：Wireshark是协议理论知识的“验证场”和“显微镜”。从ARP欺骗的MAC漂移观察到DNS隧道的随机子域名检测，每一行过滤器表达式都是对协议理解的具象化表达。
 
 **核心实战技能（必须掌握）** ：
-1. **TLS密钥解密（SSLKEYLOGFILE）** ：将HTTPS加密流量转化为明文，深入分析Web攻击载荷；
-2. **tshark命令行工具**：在无GUI的服务器环境中完成抓包、过滤、统计和异常检测；
+1. **TLS密钥解密（SSLKEYLOGFILE）** ：将HTTPS加密流量转化为明文，深入分析Web攻击载荷——注意环境变量须在启动浏览器的同一终端会话中生效；
+2. **tshark命令行工具**：在无GUI的服务器环境中完成抓包、过滤、统计和异常检测——区分`-f`（内核层粗筛）与`-Y`（用户层精筛）的使用场景；
 3. **流量统计与基线建立**：通过`Protocol Hierarchy`、`Conversations`、`Endpoints`等统计视图，建立网络流量基线，快速识别异常突增。
 
 完成Wireshark篇后，结合本系列前13篇协议深度解析，你已具备**从物理层到应用层的全栈协议分析与安全检测能力**——这正是迈向“实战型安全工程师”的关键一步。
@@ -170,3 +183,4 @@ mergecap -w merged.pcap file1.pcap file2.pcap
 ---
 
 *本文修订于2026年8月，基于Wireshark 4.2.6 / tshark 4.2.6 / Ubuntu 22.04.3 LTS环境验证。过滤器语法及功能因Wireshark版本差异可能存在细微变化，生产环境中请以具体版本文档为准。*
+如需对整个系列做综合回顾、知识图谱总结，或就任何一篇文章的进一步修订进行讨论，欢迎继续沟通。
